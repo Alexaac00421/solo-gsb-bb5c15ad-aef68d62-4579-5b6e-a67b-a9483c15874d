@@ -22,6 +22,14 @@
 - bundles 表记录导入成功的包（内容指纹 + 首次结果 JSON），
   同编号同内容重传返回首次结果、不重复写入；同编号异内容拒绝；
 - CREATE TABLE IF NOT EXISTS 随启动执行，旧库自动补表，无数据迁移。
+
+采集包撤回（withdraw，v1.10）：
+- bundles.added_detail 记录首次导入的新增/复用明细（JSON），撤回据此界定
+  "只删本包新增记录"的范围；旧包该列为 NULL，不允许撤回；
+- bundles.withdrawn_at / withdraw_result 记录撤回时间与首次撤回结果，
+  重复撤回原样返回首次结果；撤回只标记 bundles 行，不删除包记录，
+  因此同编号重传仍返回首次导入回执且不重新写入；
+- 旧库启动时自动补列，无数据迁移。
 """
 from __future__ import annotations
 
@@ -105,10 +113,16 @@ CREATE TABLE IF NOT EXISTS version_segments (
 -- 采集包（bundle，v1.8）：断网汇聚的多设备记录整包导入。
 -- 仅记录导入成功的包：内容指纹用于"同编号同内容重传返回首次结果"，
 -- result 为首次导入结果（JSON），重传时原样返回，不重复写入。
+-- 撤回（v1.10）：added_detail 为首次导入的新增/复用明细（JSON），
+-- 撤回只删除其中的新增记录；withdrawn_at/withdraw_result 记录首次撤回
+-- 结果供重复撤回幂等返回；撤回不删除包记录，同编号重传仍返回首次回执。
 CREATE TABLE IF NOT EXISTS bundles (
     bundle_id    TEXT PRIMARY KEY,
     content_hash TEXT NOT NULL,
     result       TEXT NOT NULL,
+    added_detail TEXT,
+    withdrawn_at TEXT,
+    withdraw_result TEXT,
     created_at   TEXT NOT NULL
 );
 """
@@ -234,6 +248,24 @@ def _ensure_seal_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE cycles ADD COLUMN seal_fingerprint TEXT")
 
 
+def _ensure_bundle_columns(conn: sqlite3.Connection) -> None:
+    """采集包撤回列（v1.10）：为旧库的 bundles 表补齐
+    added_detail / withdrawn_at / withdraw_result。
+
+    旧行 added_detail 为 NULL：未保存首次导入新增明细的包无法安全界定
+    撤回范围，撤回请求会被明确拒绝；其余行为（重传回执等）不变。
+    """
+    cols = _columns(conn, "bundles")
+    if not cols:
+        return
+    if "added_detail" not in cols:
+        conn.execute("ALTER TABLE bundles ADD COLUMN added_detail TEXT")
+    if "withdrawn_at" not in cols:
+        conn.execute("ALTER TABLE bundles ADD COLUMN withdrawn_at TEXT")
+    if "withdraw_result" not in cols:
+        conn.execute("ALTER TABLE bundles ADD COLUMN withdraw_result TEXT")
+
+
 def init_db(db_path: str) -> None:
     """初始化数据库（建表 + 旧库迁移）。服务启动时调用，幂等。"""
     parent = os.path.dirname(os.path.abspath(db_path))
@@ -252,6 +284,8 @@ def init_db(db_path: str) -> None:
         conn.executescript(SCHEMA)
         # 列级迁移：旧库的 cycles 表（含 v1 迁移而来的）补齐封存列
         _ensure_seal_columns(conn)
+        # 列级迁移：旧库的 bundles 表补齐撤回列（旧包 added_detail 为 NULL）
+        _ensure_bundle_columns(conn)
     finally:
         conn.close()
 

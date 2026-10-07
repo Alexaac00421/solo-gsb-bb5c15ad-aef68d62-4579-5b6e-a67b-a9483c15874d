@@ -464,6 +464,49 @@ curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
 
 
 # ----------------------------------------------------------------------
+# 采集包撤回（withdraw，v1.10）：按包编号撤回有误采集包对当前时间轴的贡献
+# 只删该包新增记录；复用的原有记录绝不可删；校验+删除在同一写事务内完成
+# ----------------------------------------------------------------------
+
+echo; echo "== 撤回 FIELD-001：其设备/锚点/声段被 FIELD-004 复用 -> 409 bundle_record_reused =="
+curl -s -X POST "$BASE/bundles/FIELD-001/withdraw" | pp
+
+echo; echo "== 先撤回复用方 FIELD-004（只删其新增的锚点 121000 与 CAP-0203）=="
+curl -s -X POST "$BASE/bundles/FIELD-004/withdraw" | pp
+
+echo; echo "== 再撤回 FIELD-001 -> 200：新增的设备/周期/锚点/声段全部删除 =="
+curl -s -X POST "$BASE/bundles/FIELD-001/withdraw" | pp
+
+echo; echo "== 重复撤回 -> 200 返回首次结果（idempotent_replay，不重复删除）=="
+curl -s -X POST "$BASE/bundles/FIELD-001/withdraw" | pp
+
+echo; echo "== 撤回后同编号重传 -> 返回首次导入回执，不重新写入 =="
+curl -s -X POST "$BASE/bundles" -H 'Content-Type: application/json' -d '{
+  "bundle_id": "FIELD-001",
+  "devices": [{"device_id": "BD1", "name": "录音笔-甲"},
+              {"device_id": "BD2", "name": "录音笔-乙"}],
+  "cycles": [{"device_id": "BD1", "cycle_id": "boot-2", "note": "第二次开机"}],
+  "anchors": [
+    {"device_id": "BD1", "cycle_id": "boot-2",
+     "local_ms": 1000, "utc_ms": 1700010000000},
+    {"device_id": "BD1", "cycle_id": "boot-2",
+     "local_ms": 61000, "utc_ms": 1700010060500},
+    {"device_id": "BD2", "local_ms": 0, "utc_ms": 1699999997000},
+    {"device_id": "BD2", "local_ms": 60000, "utc_ms": 1700000057000}
+  ],
+  "segments": [
+    {"capture_id": "CAP-0201", "device_id": "BD1", "cycle_id": "boot-2",
+     "local_start_ms": 5000, "local_end_ms": 20000, "note": "鸟鸣"},
+    {"capture_id": "CAP-0202", "device_id": "BD2",
+     "local_start_ms": 3000, "local_end_ms": 9000}
+  ]
+}' | pp
+
+echo; echo "== 包编号不存在 -> 404 bundle_not_found =="
+curl -s -X POST "$BASE/bundles/NOPE/withdraw" | pp
+
+
+# ----------------------------------------------------------------------
 # 按已发布版本恢复未封存周期（restore）：现场误改后凭已发布版本恢复
 # 使用独立设备 RS1（RD1 已在预演段封存，D1/default 已封存）
 # ----------------------------------------------------------------------

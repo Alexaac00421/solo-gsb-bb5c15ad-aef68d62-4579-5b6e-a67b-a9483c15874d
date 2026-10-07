@@ -38,6 +38,16 @@
 未标周期的冻结记录按 default 解释。版本不存在、设备/周期不存在、
 指纹过期、周期已封存，或版本声段采集编号现被其他设备/周期占用时整次
 拒绝，不留部分写入；其他周期、采集包重传回执与已发布版本保持原样。
+
+采集包撤回（withdraw，v1.10）：现场发现已导入的采集包有误时，按包
+编号撤回其对当前时间轴的贡献。仅对保存了首次导入新增明细的包开放；
+撤回只删除该包新增的设备、周期、锚点与声段，复用的原有记录绝不可删。
+若新增记录当前内容已变化或缺失、被其他未撤回包复用、相关周期已封存、
+新增设备/周期已有包外内容，或删除会改变任何保留声段的可定位状态或
+UTC 位置，均指出阻碍并整包拒绝（不改动任何数据）。校验与删除在同一
+个 BEGIN IMMEDIATE 写事务内完成，与并发导入、更正、封存、发布串行
+判定。重复撤回返回首次结果；撤回不删除包记录，同编号重传仍返回首次
+导入回执且不重新写入；已发布版本保持原快照。
 """
 from __future__ import annotations
 
@@ -1197,13 +1207,398 @@ def import_bundle(db_path: str, body):
                 "message": "采集包已整包导入：当前时间轴立即反映入库结果，"
                            "已发布版本保持原快照",
             }
-            # 记录首次结果：同编号同内容重传时原样返回，不重复写入
+            # 首次导入新增/复用明细（v1.10 撤回据此界定撤回范围）：
+            # 记录完整内容，撤回时在同事务内逐条核对"当前内容未变化"
+            def _detail_records(kind, keys):
+                src = {"devices": devices, "cycles": cycles,
+                       "anchors": anchors, "segments": segments}[kind]
+                return sorted((src[k] for k in keys),
+                              key=lambda r: json.dumps(r, sort_keys=True))
+
+            detail = {
+                "added": {
+                    "devices": _detail_records("devices", device_added),
+                    "cycles": _detail_records("cycles", cycle_added),
+                    "anchors": _detail_records("anchors", anchor_added),
+                    "segments": _detail_records("segments", segment_added),
+                },
+                "reused": {
+                    "devices": _detail_records("devices", device_reused),
+                    "cycles": _detail_records("cycles", cycle_reused),
+                    "anchors": _detail_records("anchors", anchor_reused),
+                    "segments": _detail_records("segments", segment_reused),
+                },
+            }
+            # 记录首次结果与新增明细：同编号同内容重传时原样返回首次结果，
+            # 不重复写入；撤回只删除明细中的新增记录
             conn.execute(
-                "INSERT INTO bundles(bundle_id, content_hash, result, created_at) "
-                "VALUES (?,?,?,?)",
+                "INSERT INTO bundles(bundle_id, content_hash, result, added_detail, "
+                "created_at) VALUES (?,?,?,?,?)",
                 (bundle_id, digest,
-                 json.dumps(result, ensure_ascii=False, sort_keys=True), now))
+                 json.dumps(result, ensure_ascii=False, sort_keys=True),
+                 json.dumps(detail, ensure_ascii=False, sort_keys=True), now))
             return 201, {**result, "idempotent_replay": False}
+
+
+# ---------------------------------------------------------------- 采集包撤回
+
+def _bundle_detail_maps(detail: dict):
+    """把首次导入明细的"新增"部分索引为便于核对的映射。
+
+    返回 (devices, cycles, anchors, segments) 四个 dict，键分别为
+    device_id / (device_id, cycle_id) / (device_id, cycle_id, local_ms) /
+    capture_id，值为明细中的完整记录。
+    """
+    added = detail.get("added", {})
+    devices = {r["device_id"]: r for r in added.get("devices", [])}
+    cycles = {(r["device_id"], r["cycle_id"]): r
+              for r in added.get("cycles", [])}
+    anchors = {(r["device_id"], r["cycle_id"], r["local_ms"]): r
+               for r in added.get("anchors", [])}
+    segments = {r["capture_id"]: r for r in added.get("segments", [])}
+    return devices, cycles, anchors, segments
+
+
+def withdraw_bundle(db_path: str, bundle_id: str):
+    """采集包撤回：按包编号撤回已导入采集包对当前时间轴的贡献。
+
+    - 仅对保存了首次导入新增明细的包开放（v1.10 起导入的包）；旧包缺少
+      新增明细 -> 409 bundle_withdraw_unavailable；包编号不存在 -> 404；
+    - 撤回只删除该包**新增**的设备、周期、锚点与声段；复用的原有记录
+      绝不删除；
+    - 整包拒绝（不改动任何数据）：
+      * 新增记录当前内容已变化或已缺失 -> 409 bundle_content_changed；
+      * 新增记录被其他未撤回包引用（新增或复用）-> 409 bundle_record_reused；
+      * 相关周期已封存 -> 409 cycle_sealed；
+      * 新增设备/周期已存在包外内容 -> 409 bundle_external_content；
+      * 删除会改变任何保留声段的可定位状态或 UTC 位置
+        -> 409 bundle_projection_changed；
+    - 校验与删除在同一个 BEGIN IMMEDIATE 写事务内完成，与并发导入、
+      更正、封存、发布串行判定；已发布版本保持原快照；
+    - 重复撤回 -> 200 返回首次撤回结果（idempotent_replay: true）；
+      撤回不删除包记录，同编号重传仍返回首次导入回执且不重新写入。
+    """
+    with db.session(db_path) as conn:
+        with db.write_txn(conn):
+            row = conn.execute(
+                "SELECT added_detail, withdrawn_at, withdraw_result "
+                "FROM bundles WHERE bundle_id=?", (bundle_id,)).fetchone()
+            if row is None:
+                raise ApiError(
+                    404, "bundle_not_found",
+                    f"采集包 {bundle_id} 不存在（未成功导入或编号有误），无法撤回",
+                    {"bundle_id": bundle_id})
+            # 重复撤回：返回首次撤回结果，不重复删除
+            if row["withdrawn_at"] is not None:
+                result = json.loads(row["withdraw_result"])
+                result["idempotent_replay"] = True
+                return 200, result
+            if row["added_detail"] is None:
+                raise ApiError(
+                    409, "bundle_withdraw_unavailable",
+                    f"采集包 {bundle_id} 导入时未保存首次导入新增明细"
+                    f"（撤回能力上线前的旧包），无法安全界定撤回范围，拒绝撤回",
+                    {"bundle_id": bundle_id})
+            detail = json.loads(row["added_detail"])
+            added_devices, added_cycles, added_anchors, added_segments = \
+                _bundle_detail_maps(detail)
+
+            # 1) 内容核对：每条新增记录必须仍存在且内容与首次导入一致
+            #    （被更正/删除/改归属的记录不允许随撤回误删他人改动）
+            changed = []
+            for dev, rec in sorted(added_devices.items()):
+                r = conn.execute("SELECT name FROM devices WHERE device_id=?",
+                                 (dev,)).fetchone()
+                if r is None:
+                    changed.append({"type": "device", "device_id": dev,
+                                    "reason": "missing"})
+                elif r["name"] != rec["name"]:
+                    changed.append({"type": "device", "device_id": dev,
+                                    "reason": "content_changed",
+                                    "expected": {"name": rec["name"]},
+                                    "actual": {"name": r["name"]}})
+            for (dev, cyc), rec in sorted(added_cycles.items()):
+                r = conn.execute(
+                    "SELECT note FROM cycles WHERE device_id=? AND cycle_id=?",
+                    (dev, cyc)).fetchone()
+                if r is None:
+                    changed.append({"type": "cycle", "device_id": dev,
+                                    "cycle_id": cyc, "reason": "missing"})
+                elif r["note"] != rec["note"]:
+                    changed.append({"type": "cycle", "device_id": dev,
+                                    "cycle_id": cyc, "reason": "content_changed",
+                                    "expected": {"note": rec["note"]},
+                                    "actual": {"note": r["note"]}})
+            for (dev, cyc, local), rec in sorted(added_anchors.items()):
+                r = conn.execute(
+                    "SELECT utc_ms FROM anchors WHERE device_id=? AND cycle_id=? "
+                    "AND local_ms=?", (dev, cyc, local)).fetchone()
+                if r is None:
+                    changed.append({"type": "anchor", "device_id": dev,
+                                    "cycle_id": cyc, "local_ms": local,
+                                    "reason": "missing"})
+                elif r["utc_ms"] != rec["utc_ms"]:
+                    changed.append({"type": "anchor", "device_id": dev,
+                                    "cycle_id": cyc, "local_ms": local,
+                                    "reason": "content_changed",
+                                    "expected": {"utc_ms": rec["utc_ms"]},
+                                    "actual": {"utc_ms": r["utc_ms"]}})
+            for cid, rec in sorted(added_segments.items()):
+                r = conn.execute(
+                    "SELECT content_hash FROM segments WHERE capture_id=?",
+                    (cid,)).fetchone()
+                digest = segment_content_hash(
+                    cid, rec["device_id"], rec["cycle_id"],
+                    rec["local_start_ms"], rec["local_end_ms"], rec["note"])
+                if r is None:
+                    changed.append({"type": "segment", "capture_id": cid,
+                                    "reason": "missing"})
+                elif r["content_hash"] != digest:
+                    changed.append({"type": "segment", "capture_id": cid,
+                                    "reason": "content_changed"})
+            if changed:
+                raise ApiError(
+                    409, "bundle_content_changed",
+                    f"采集包 {bundle_id} 的 {len(changed)} 条新增记录当前内容"
+                    f"已变化或已缺失，撤回将误删他人改动，整包拒绝，不改动任何数据",
+                    {"bundle_id": bundle_id, "changed": changed})
+
+            # 2) 封存保护：将被删除或失去记录的相关周期一律不得已封存
+            affected_cycles = set(added_cycles)
+            affected_cycles |= {(d, c) for (d, c, _) in added_anchors}
+            affected_cycles |= {(r["device_id"], r["cycle_id"])
+                                for r in added_segments.values()}
+            if added_devices:
+                # 删除新增设备会级联删除其全部周期，逐一核对封存状态
+                ph = ",".join("?" for _ in added_devices)
+                for r in conn.execute(
+                        f"SELECT device_id, cycle_id FROM cycles "
+                        f"WHERE device_id IN ({ph})",
+                        tuple(sorted(added_devices))).fetchall():
+                    affected_cycles.add((r["device_id"], r["cycle_id"]))
+            sealed = []
+            for dev, cyc in sorted(affected_cycles):
+                r = conn.execute(
+                    "SELECT sealed_at FROM cycles WHERE device_id=? AND cycle_id=?",
+                    (dev, cyc)).fetchone()
+                if r is not None and r["sealed_at"] is not None:
+                    sealed.append({"device_id": dev, "cycle_id": cyc,
+                                   "sealed_at": r["sealed_at"]})
+            if sealed:
+                raise ApiError(
+                    409, "cycle_sealed",
+                    f"采集包 {bundle_id} 涉及的周期已封存，内容已冻结，"
+                    f"整包拒绝，不改动任何数据",
+                    {"bundle_id": bundle_id, "cycles": sealed})
+
+            # 3) 复用保护：新增记录被其他未撤回包引用（新增或复用）-> 拒绝
+            other_refs: dict[str, dict] = {"devices": {}, "cycles": {},
+                                           "anchors": {}, "segments": {}}
+            for r in conn.execute(
+                    "SELECT bundle_id, added_detail FROM bundles "
+                    "WHERE bundle_id<>? AND withdrawn_at IS NULL "
+                    "AND added_detail IS NOT NULL", (bundle_id,)).fetchall():
+                other = json.loads(r["added_detail"])
+                for section in ("added", "reused"):
+                    part = other.get(section, {})
+                    for rec in part.get("devices", []):
+                        other_refs["devices"].setdefault(
+                            rec["device_id"], set()).add(r["bundle_id"])
+                    for rec in part.get("cycles", []):
+                        other_refs["cycles"].setdefault(
+                            (rec["device_id"], rec["cycle_id"]),
+                            set()).add(r["bundle_id"])
+                    for rec in part.get("anchors", []):
+                        other_refs["anchors"].setdefault(
+                            (rec["device_id"], rec["cycle_id"], rec["local_ms"]),
+                            set()).add(r["bundle_id"])
+                    for rec in part.get("segments", []):
+                        other_refs["segments"].setdefault(
+                            rec["capture_id"], set()).add(r["bundle_id"])
+            reused_conflicts = []
+            for dev in sorted(added_devices):
+                if dev in other_refs["devices"]:
+                    reused_conflicts.append({
+                        "type": "device", "device_id": dev,
+                        "bundle_ids": sorted(other_refs["devices"][dev])})
+            for dev, cyc in sorted(added_cycles):
+                if (dev, cyc) in other_refs["cycles"]:
+                    reused_conflicts.append({
+                        "type": "cycle", "device_id": dev, "cycle_id": cyc,
+                        "bundle_ids": sorted(other_refs["cycles"][(dev, cyc)])})
+            for dev, cyc, local in sorted(added_anchors):
+                if (dev, cyc, local) in other_refs["anchors"]:
+                    reused_conflicts.append({
+                        "type": "anchor", "device_id": dev, "cycle_id": cyc,
+                        "local_ms": local,
+                        "bundle_ids": sorted(
+                            other_refs["anchors"][(dev, cyc, local)])})
+            for cid in sorted(added_segments):
+                if cid in other_refs["segments"]:
+                    reused_conflicts.append({
+                        "type": "segment", "capture_id": cid,
+                        "bundle_ids": sorted(other_refs["segments"][cid])})
+            if reused_conflicts:
+                raise ApiError(
+                    409, "bundle_record_reused",
+                    f"采集包 {bundle_id} 的 {len(reused_conflicts)} 条新增记录"
+                    f"被其他未撤回采集包引用（新增或复用），删除将破坏这些包的"
+                    f"贡献，整包拒绝，不改动任何数据",
+                    {"bundle_id": bundle_id, "reused": reused_conflicts})
+
+            # 4) 包外内容：新增设备/周期当前只允许包含本包新增记录，
+            #    否则删除将波及包外记录
+            external = []
+            for dev in sorted(added_devices):
+                for r in conn.execute(
+                        "SELECT cycle_id FROM cycles WHERE device_id=?",
+                        (dev,)).fetchall():
+                    c = r["cycle_id"]
+                    if c != DEFAULT_CYCLE_ID and (dev, c) not in added_cycles:
+                        external.append({"type": "cycle", "device_id": dev,
+                                         "cycle_id": c,
+                                         "reason": "cycle_registered_outside_bundle"})
+                for r in conn.execute(
+                        "SELECT cycle_id, local_ms FROM anchors WHERE device_id=?",
+                        (dev,)).fetchall():
+                    if (dev, r["cycle_id"], r["local_ms"]) not in added_anchors:
+                        external.append({"type": "anchor", "device_id": dev,
+                                         "cycle_id": r["cycle_id"],
+                                         "local_ms": r["local_ms"],
+                                         "reason": "anchor_outside_bundle"})
+                for r in conn.execute(
+                        "SELECT capture_id FROM segments WHERE device_id=?",
+                        (dev,)).fetchall():
+                    if r["capture_id"] not in added_segments:
+                        external.append({"type": "segment",
+                                         "capture_id": r["capture_id"],
+                                         "device_id": dev,
+                                         "reason": "segment_outside_bundle"})
+            for dev, cyc in sorted(added_cycles):
+                if dev in added_devices:
+                    continue  # 设备级检查已覆盖该周期
+                for r in conn.execute(
+                        "SELECT local_ms FROM anchors WHERE device_id=? "
+                        "AND cycle_id=?", (dev, cyc)).fetchall():
+                    if (dev, cyc, r["local_ms"]) not in added_anchors:
+                        external.append({"type": "anchor", "device_id": dev,
+                                         "cycle_id": cyc,
+                                         "local_ms": r["local_ms"],
+                                         "reason": "anchor_outside_bundle"})
+                for r in conn.execute(
+                        "SELECT capture_id FROM segments WHERE device_id=? "
+                        "AND cycle_id=?", (dev, cyc)).fetchall():
+                    if r["capture_id"] not in added_segments:
+                        external.append({"type": "segment",
+                                         "capture_id": r["capture_id"],
+                                         "device_id": dev, "cycle_id": cyc,
+                                         "reason": "segment_outside_bundle"})
+            if external:
+                raise ApiError(
+                    409, "bundle_external_content",
+                    f"采集包 {bundle_id} 新增的设备/周期已存在包外内容，"
+                    f"删除将波及非本包记录，整包拒绝，不改动任何数据",
+                    {"bundle_id": bundle_id, "external": external})
+
+            # 5) 定位保护：模拟删除新增锚点后，任何保留声段的可定位状态
+            #    与 UTC 位置都不得改变
+            cycles_losing_anchors: dict[tuple[str, str], set[int]] = {}
+            for dev, cyc, local in added_anchors:
+                cycles_losing_anchors.setdefault((dev, cyc), set()).add(local)
+            deleted_cycles = set(added_cycles)
+            if added_devices:
+                ph = ",".join("?" for _ in added_devices)
+                for r in conn.execute(
+                        f"SELECT device_id, cycle_id FROM cycles "
+                        f"WHERE device_id IN ({ph})",
+                        tuple(sorted(added_devices))).fetchall():
+                    deleted_cycles.add((r["device_id"], r["cycle_id"]))
+            projection_changes = []
+            for (dev, cyc), removed_locals in sorted(cycles_losing_anchors.items()):
+                if (dev, cyc) in deleted_cycles:
+                    continue  # 整周期随撤回删除，其声段均为本包新增（步骤 4 已保证）
+                current = _anchors_of(conn, dev, cyc)
+                remaining = [a for a in current
+                             if a["local_ms"] not in removed_locals]
+                before_pair = ([a["local_ms"] for a in current],
+                               [a["utc_ms"] for a in current])
+                after_pair = ([a["local_ms"] for a in remaining],
+                              [a["utc_ms"] for a in remaining])
+                for sr in conn.execute(
+                        "SELECT * FROM segments WHERE device_id=? AND cycle_id=? "
+                        "ORDER BY capture_id", (dev, cyc)).fetchall():
+                    if sr["capture_id"] in added_segments:
+                        continue  # 本包新增声段随撤回删除，不参与判定
+                    seg = _row_to_segment(sr)
+                    before = project_segment(seg, before_pair)
+                    after = project_segment(seg, after_pair)
+                    if (before["status"], before["utc_start_ms"],
+                            before["utc_end_ms"]) != \
+                       (after["status"], after["utc_start_ms"],
+                            after["utc_end_ms"]):
+                        projection_changes.append({
+                            "capture_id": sr["capture_id"], "device_id": dev,
+                            "cycle_id": cyc,
+                            "before": {"status": before["status"],
+                                       "utc_start_ms": before["utc_start_ms"],
+                                       "utc_end_ms": before["utc_end_ms"]},
+                            "after": {"status": after["status"],
+                                      "utc_start_ms": after["utc_start_ms"],
+                                      "utc_end_ms": after["utc_end_ms"]}})
+            if projection_changes:
+                raise ApiError(
+                    409, "bundle_projection_changed",
+                    f"撤回采集包 {bundle_id} 将改变 {len(projection_changes)} 段"
+                    f"保留声段的可定位状态或 UTC 位置，整包拒绝，不改动任何数据",
+                    {"bundle_id": bundle_id, "segments": projection_changes})
+
+            # 6) 全部校验通过：只删除本包新增记录（声段 -> 锚点 -> 周期 -> 设备，
+            #    外键方向安全；复用的原有记录绝不删除）
+            now = iso_now()
+            if added_segments:
+                ph = ",".join("?" for _ in added_segments)
+                conn.execute(f"DELETE FROM segments WHERE capture_id IN ({ph})",
+                             tuple(sorted(added_segments)))
+            for dev, cyc, local in sorted(added_anchors):
+                conn.execute(
+                    "DELETE FROM anchors WHERE device_id=? AND cycle_id=? "
+                    "AND local_ms=?", (dev, cyc, local))
+            for dev, cyc in sorted(added_cycles):
+                conn.execute("DELETE FROM cycles WHERE device_id=? AND cycle_id=?",
+                             (dev, cyc))
+            if added_devices:
+                # 隐式 default 周期随设备级联删除（其内容经步骤 4 核对均为本包新增）
+                ph = ",".join("?" for _ in added_devices)
+                conn.execute(f"DELETE FROM devices WHERE device_id IN ({ph})",
+                             tuple(sorted(added_devices)))
+
+            result = {
+                "bundle_id": bundle_id,
+                "status": "withdrawn",
+                "withdrawn_at": now,
+                "devices": {"removed": len(added_devices),
+                            "device_ids": sorted(added_devices)},
+                "cycles": {"removed": len(added_cycles),
+                           "cycles": [{"device_id": d, "cycle_id": c}
+                                      for d, c in sorted(added_cycles)]},
+                "anchors": {"removed": len(added_anchors),
+                            "anchors": [{"device_id": d, "cycle_id": c,
+                                         "local_ms": l}
+                                        for d, c, l in sorted(added_anchors)]},
+                "segments": {"removed": len(added_segments),
+                             "capture_ids": sorted(added_segments)},
+                "message": "采集包已撤回：仅删除该包首次导入新增的设备/周期/锚点/"
+                           "声段，复用的原有记录保持不变；当前时间轴立即反映撤回"
+                           "结果，已发布版本保持原快照",
+            }
+            # 标记撤回（不删除包记录）：重复撤回返回首次结果；
+            # 同编号重传仍返回首次导入回执且不重新写入
+            conn.execute(
+                "UPDATE bundles SET withdrawn_at=?, withdraw_result=? "
+                "WHERE bundle_id=?",
+                (now, json.dumps(result, ensure_ascii=False, sort_keys=True),
+                 bundle_id))
+            return 200, {**result, "idempotent_replay": False}
 
 
 # ---------------------------------------------------------------- 当前时间轴

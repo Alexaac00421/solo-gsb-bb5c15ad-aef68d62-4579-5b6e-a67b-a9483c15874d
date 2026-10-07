@@ -3,4 +3,4 @@
 仅依赖 Python 标准库：http.server + sqlite3。
 """
 
-__version__ = "1.9.0"
+__version__ = "1.10.0"
