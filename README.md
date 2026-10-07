@@ -12,6 +12,7 @@
 - **现场时钟漂移审计（drift audit，v1.6 新增）**：现场校准后，运维人员提交**设备编号、周期编号、非负最大时钟漂移 ppm**（可选已发布版本号）；服务读取该周期**当前锚点**或**指定版本冻结锚点**（旧版快照缺失周期归属按 default 处理），按本地时间**相邻配对**，逐段计算 UTC/本地速率与（有符号）漂移 ppm，标出 `|漂移|` 超过阈值的区间，并给出**首尾锚点、本地/UTC 区间跨度、异常原因与偏快/偏慢方向**；锚点少于两个（`400 insufficient_anchors`）、阈值非法（`400 invalid_threshold`）、设备/周期/版本不存在（`404`）均明确拒绝、**不改动任何数据**；纯只读接口，封存周期同样可审计。
 - **锚点更正覆盖预演（coverage rehearsal，v1.7 新增）**：现场人员在**实际更正某设备周期锚点之前**，先预演指定 UTC 半开时段的录音覆盖会否恶化。提交设备/周期、**周期详情中的内容指纹**、**拟整体替换的非空锚点列表**、时段起止与最少设备数；服务在**同一当前快照**内，按现有周期映射与毫秒取整规则分别计算**更正前**与**假设更正后**的覆盖（其他周期与设备保持当前值），返回两侧覆盖结论（片段/连续缺口/统计）以及**原先达标而预演后不达标的各个连续区间**（含两侧设备并集与峰值设备数）。同设备重叠声段只算一台、不可定位声段不计；指纹过期（`409 rehearsal_fingerprint_stale`）、周期已封存（`409 cycle_sealed`）、锚点不严格递增（`400 anchors_not_increasing`）、时间或门槛非法（`400`）、设备或周期不存在（`404`）一律明确拒绝。**预演纯只读**：不写入、不影响当前时间轴或任何已发布版本。
 - **采集包导入（bundle，v1.8 新增）**：现场设备断网期间，把多台设备的**登记信息、时钟周期、同步锚点与声段**汇成一个采集包，恢复网络后经 `POST /bundles` 整包上传。包内记录**顺序不限**，可引用**同包登记**的设备与周期；锚点按**每周期最终序列**（库中现有 + 包内新增合并）校验，不因上传顺序误拒。**相同包编号 + 相同记录集合**重传返回首次结果且不重复写入；**编号复用但内容不同、同标识记录与库中冲突、引用缺失、锚点序列非法或试图变更封存周期**时指出原因并**整包拒绝、不留部分数据**。成功返回各类记录的**新增与复用数量**；当前时间轴立即反映入库结果，已发布版本保持原快照；整个导入在单个写事务内完成，并发导入与发布都不会观察到半包状态。
+- **采集包撤回（withdraw，v1.10 新增）**：现场发现已导入的采集包有误时，`POST /bundles/{bundle_id}/withdraw` 按包编号撤回其对当前时间轴的贡献——**只删除该包首次导入新增**的设备、周期（含新设备隐式 default 周期）、锚点与声段，**复用的原有记录绝不删除**。仅对保存了首次导入新增明细的包开放；新增记录当前内容已变化、被其他未撤回包复用、新设备/周期已有包外内容、相关周期已封存，或删除会改变任何保留声段的可定位状态/UTC 位置时，**指出阻碍并整包拒绝、不改动任何数据**。校验与删除在同一写事务内完成，与并发导入、更正、封存、发布串行判定；撤回后包行保留：重复撤回返回首次撤回结果，同编号导入重传仍返回首次导入回执且不重新写入，已发布版本保持原快照。
 
 ## 快速开始
 
@@ -311,6 +312,38 @@ python3 -m app          # 自动建库建表（默认 ./data/timeline.db），�
 }
 ```
 
+### 采集包撤回（withdraw）
+
+现场发现已导入的采集包有误时，按包编号撤回其对**当前时间轴**的贡献。`POST /bundles/{bundle_id}/withdraw`（无需请求体）：
+
+- **只删新增，复用不碰**：撤回只删除该包**首次导入新增**的设备、周期（含新设备隐式创建的 `default` 周期，计入 `cycles.removed`）、锚点与声段；导入时**复用**的原有记录（设备/周期/锚点/声段）**绝不删除**。
+- **仅对保存了首次导入新增明细的包开放**：v1.10 起导入的包在导入成功时一并保存新增明细（全内容）与包引用键集；此前导入的旧包缺少新增明细，撤回明确拒绝（`409 bundle_details_missing`），不改动任何数据。
+- **整包拒绝（指出阻碍，不改动任何数据，包保持未撤回）**：
+  - 新增记录当前内容已变化（锚点被更正/删除、声段被删除/改归属、设备/周期被改动）→ `409 bundle_record_changed`，`details.changed` 逐条列出期望与当前内容；
+  - 新增记录被其他**未撤回**包引用（复用）→ `409 bundle_record_reused`，`details.reused_by` 列出依赖方包编号与重叠记录；先撤回依赖方即可再撤回本包；
+  - 新设备/周期已有**包外内容**（直接录入或其他包追加的周期/锚点/声段）→ `409 bundle_external_content`，`details.external` 逐条列出；
+  - 相关周期已封存 → `409 cycle_sealed`；
+  - 删除新增锚点会改变任何**保留声段**的可定位状态或 UTC 位置 → `409 bundle_projection_shift`，`details.affected_segments` 列出前后投影；
+  - 包编号不存在 → `404 bundle_not_found`；包编号非法 → `400 validation_error`。
+- **成功响应（200）**：`status: "withdrawn"`、`withdrawn_at` 与各类**撤回数量** `devices/cycles/anchors/segments: {removed}`；当前时间轴立即反映撤回结果，**已发布版本保持原快照**（之后发布的版本在 `changes.removed` 中体现移除）。
+- **幂等与回执保留**：撤回成功后包行保留——**重复撤回**返回首次撤回结果（`200`，`idempotent_replay: true`，撤回时间不变）；**同编号导入重传**仍返回首次导入回执且**不重新写入**（同编号异内容仍 `409 bundle_conflict`）。
+- **事务与并发**：撤回的校验与删除在同一个 `BEGIN IMMEDIATE` 写事务内完成，与并发导入、锚点更正、封存、版本发布**串行判定**，不会出现半撤回状态。
+
+响应示例（节选）：
+
+```json
+{
+  "bundle_id": "FIELD-2026-10-06-001",
+  "status": "withdrawn",
+  "withdrawn_at": "2026-10-07T08:00:00.000Z",
+  "devices":  {"removed": 2},
+  "cycles":   {"removed": 3},
+  "anchors":  {"removed": 4},
+  "segments": {"removed": 2},
+  "idempotent_replay": false
+}
+```
+
 ### 线性漂移映射
 
 每台设备、**每个时钟周期**的锚点按本地时间排序后，在相邻锚点 `(l0,u0)`、`(l1,u1)` 间线性映射：
@@ -365,6 +398,13 @@ utc(t) = u0 + (t - l0) * (u1 - u0) / (l1 - l0)     # 结果四舍五入到毫秒
 | 采集包：引用未登记设备/周期（且未随包登记） | `404 device_not_found` / `404 cycle_not_found` |
 | 采集包：合并后锚点最终序列非法 | `400 anchors_not_increasing` |
 | 采集包：向已封存周期写入新锚点/声段 | `409 cycle_sealed` |
+| 采集包撤回：包编号不存在 | `404 bundle_not_found` |
+| 采集包撤回：旧包缺少首次导入新增明细 | `409 bundle_details_missing` |
+| 采集包撤回：新增记录当前内容已变化 | `409 bundle_record_changed` |
+| 采集包撤回：新增记录被其他未撤回包复用 | `409 bundle_record_reused` |
+| 采集包撤回：新设备/周期已有包外内容 | `409 bundle_external_content` |
+| 采集包撤回：相关周期已封存 | `409 cycle_sealed` |
+| 采集包撤回：删除将改变保留声段的可定位状态/UTC 位置 | `409 bundle_projection_shift` |
 | 版本恢复：指纹与当前内容不一致（指纹过期） | `409 restore_fingerprint_stale` |
 | 版本恢复：周期已封存 | `409 cycle_sealed` |
 | 版本恢复：版本/设备/周期不存在 | `404 version_not_found` / `404 device_not_found` / `404 cycle_not_found` |
@@ -414,6 +454,7 @@ utc(t) = u0 + (t - l0) * (u1 - u0) / (l1 - l0)     # 结果四舍五入到毫秒
 | POST | `/segments` | 提交声段 `{capture_id, device_id, local_start_ms, local_end_ms, cycle_id?, note?}` |
 | POST | `/segments/reassign-cycle` | **批量纠正周期归属** `{items:[{capture_id, from_cycle_id, to_cycle_id}]}`（整批原子） |
 | POST | `/bundles` | **采集包导入** `{bundle_id, devices?, cycles?, anchors?, segments?}`（整包原子、包级幂等） |
+| POST | `/bundles/{bundle_id}/withdraw` | **采集包撤回**：按包编号撤回首次导入新增的记录（原子、幂等） |
 | GET | `/segments` / `/segments/{capture_id}` | 声段列表（可加 `?device_id=&cycle_id=`）/ 单个 |
 | DELETE | `/segments/{capture_id}` | 删除声段（下一版体现为"移除"） |
 | GET | `/timeline/current` | 当前时间轴（按现有锚点实时重算，显示周期归属） |
@@ -926,6 +967,43 @@ curl -s -X POST $BASE/devices/D1/cycles/default/restore \
 python3 examples/restore_example.py http://localhost:8000
 ```
 
+### 采集包撤回（按包编号撤回有误的已导入包）
+
+```bash
+BASE=http://localhost:8000
+
+# 1. 撤回：只删除该包首次导入新增的设备/周期（含隐式 default 周期）/锚点/声段，
+#    复用的原有记录绝不删除；返回各类撤回数量与状态
+curl -s -X POST $BASE/bundles/FIELD-2026-10-06-001/withdraw
+# => 200 {"bundle_id":"FIELD-2026-10-06-001","status":"withdrawn",
+#         "withdrawn_at":"...","devices":{"removed":2},"cycles":{"removed":3},
+#         "anchors":{"removed":4},"segments":{"removed":2},"idempotent_replay":false}
+
+# 2. 重复撤回 -> 200 返回首次撤回结果（撤回时间不变，幂等）
+curl -s -X POST $BASE/bundles/FIELD-2026-10-06-001/withdraw
+
+# 3. 撤回后同编号同内容重传 -> 200 返回首次导入回执，不重新写入；
+#    同编号异内容 -> 409 bundle_conflict；已发布版本保持原快照
+curl -s -X POST $BASE/bundles -H 'Content-Type: application/json' -d '{ ...原包内容... }'
+curl -s $BASE/versions/1
+
+# 4. 整包拒绝（指出阻碍，不改动任何数据，包保持未撤回）：
+#    新增记录被更正/删除/改归属 -> 409 bundle_record_changed（details.changed）
+#    新增记录被其他未撤回包复用 -> 409 bundle_record_reused（details.reused_by，
+#                                 先撤回依赖方即可再撤回本包）
+#    新设备/周期已有包外内容   -> 409 bundle_external_content（details.external）
+#    相关周期已封存           -> 409 cycle_sealed
+#    删除将改变保留声段定位/UTC -> 409 bundle_projection_shift（details.affected_segments）
+#    旧包缺少新增明细         -> 409 bundle_details_missing
+#    包编号不存在             -> 404 bundle_not_found
+```
+
+独立示例（自动演示导入/撤回/幂等重放/重传回执/各类整包拒绝/复用保护）：
+
+```bash
+python3 examples/withdraw_example.py http://localhost:8000
+```
+
 ### 响应示例
 
 `POST /versions` 返回（v1.1 周期版，节选）：
@@ -987,8 +1065,9 @@ python3 -m unittest discover -s tests -v
 - `tests/test_rehearsal.py`（21 个）：锚点更正覆盖预演的两侧同快照计算（更正前一侧与当前覆盖审计逐字段一致）、整体平移/改善/两侧多段退化（不连通区间分别列出、相邻退化分片合并）、毫秒取整口径与实际更正后审计一致、拟锚点覆盖不足致声段不可定位、同设备重叠只算一台、不可定位声段不计、其他周期与设备保持当前值、指纹过期/格式非法、周期封存拒绝、锚点非严格递增（local 重复/utc 非递增/乱序提交）、时间/区间/门槛非法、空或畸形锚点、缺字段、设备/周期不存在的明确拒绝、成功与被拒绝预演均只读（当前时间轴与已发布版本不变）、以及**预演与实际更正/发布并发**下两侧片段均拼满查询区间且恶化统计自洽。
 - `tests/test_bundle.py`（23 个）：采集包导入的成功计数与时间轴反映、包内乱序与同包引用（含隐式 default 周期）、与库中记录混合的新增/复用计数、空包、相同包乱序重传返回首次结果且不重复写入、状态变化（封存）后重传仍返回首次结果、包编号复用异内容拒绝、**被拒绝不留痕迹且编号可重用**、设备/周期/声段与库中或包内冲突的整包拒绝、引用缺失、锚点最终序列合并校验（库中+包内）、封存周期新增拒绝而完全一致记录复用、字段校验、已发布版本不变而新版反映导入、以及**并发导入与发布**下无半包状态、同包并发重传只写一次。
 - `tests/test_restore.py`（26 个）：按版本恢复的锚点整体替换与声段补齐/更新/删除、恢复前后指纹与数量及 inserted/updated/removed 分类、恢复后投影与冻结投影一致、当前时间轴/列表/详情计数同步、补录沿用冻结 created_at 而更新保留现有 created_at、恢复后同内容重传幂等异内容冲突、只改目标周期（其他周期/设备不变）、已发布版本与采集包回执不变且恢复不产生新版本、占用拒绝无部分写入、指纹过期/版本或设备或周期不存在/周期已封存/版本中无该周期内容（空周期不清除，含旧版非 default）/采集编号被其他周期或设备占用的整次拒绝、仅锚点或仅声段冻结内容、非 default 周期恢复、字段非法/缺字段、以及**旧版 format_rev=1 未标周期记录按 default 恢复**。
+- `tests/test_withdraw.py`（24 个）：采集包撤回的成功计数（含隐式 default 周期）与时间轴反映、只删新增而复用记录保留、重复撤回返回首次结果、撤回后同编号重传返回首次导入回执且不重新写入（异内容仍冲突）、已发布版本不变而新版体现移除、新增记录内容变化（更正/删除/改归属）/被其他包复用/新设备或周期有包外内容（直接录入或其他包追加）/周期已封存/保留声段定位将改变的整包拒绝且不留下任何变化、旧包缺少新增明细拒绝（含**旧库 bundles 表自动补列迁移**）、依赖方先撤回后可撤回、空新增包撤回、不影响其他包与直接录入记录、以及**撤回与导入/发布并发**下串行判定、同包并发撤回只生效一次。
 
-## 升级与数据迁移（v1.0 → … → v1.8 → v1.9）
+## 升级与数据迁移（v1.0 → … → v1.9 → v1.10）
 
 - 沿用原启动方式（`python3 -m app` / Docker / Compose），服务启动时自动识别并在线迁移旧库，无需手工操作；
 - 旧设备自动补登 `default` 周期；旧锚点与声段一律归入 `default`；旧声段内容指纹按含周期的新口径重算（默认周期同内容重传仍为幂等）；
@@ -1002,6 +1081,7 @@ python3 -m unittest discover -s tests -v
 - v1.7 新增 `POST /devices/{id}/cycles/{cycle_id}/coverage/rehearse` 锚点更正覆盖预演端点（只读），**无表结构变更、无数据迁移**，旧库直接可用；预演仅在读事务快照内做内存锚点替换，从不写入，当前时间轴与已发布版本均不受影响。
 - v1.8 新增 `POST /bundles` 采集包导入端点与 `bundles` 表（记录导入成功的包：内容指纹 + 首次结果 JSON）；`CREATE TABLE IF NOT EXISTS` 随启动自动补表，**无数据迁移**，旧库直接可用；既有单条录入、周期封存与版本发布的调用及结果不受影响。
 - v1.9 新增 `POST /devices/{id}/cycles/{cycle_id}/restore` 按已发布版本恢复未封存周期端点，**无表结构变更、无数据迁移**，旧库直接可用；恢复只重写目标周期的既有 `anchors` / `segments` 行，从既有 `versions` / `version_anchors` / `version_segments` 读取冻结内容（旧版 `format_rev=1` 的 NULL 周期按 `default` 解释），`bundles` 回执与已发布版本快照均不改动。
+- v1.10 新增 `POST /bundles/{bundle_id}/withdraw` 采集包撤回端点；`bundles` 表增加 `added_details` / `record_keys` / `withdrawn_at` / `withdrawal_result` 四列，**旧库启动时自动补列**，既有包的重传幂等行为不变；升级后导入的包保存首次导入新增明细（可撤回），**旧包该列为空即"缺少新增明细"，撤回明确拒绝**，其余行为与升级前一致。
 
 ## 项目结构
 
@@ -1023,6 +1103,7 @@ tests/test_drift.py    # 端到端测试（现场时钟漂移审计 + 历史冻�
 tests/test_rehearsal.py # 端到端测试（锚点更正覆盖预演：两侧同快照对比、恶化区间、只读与拒绝契约）
 tests/test_bundle.py   # 端到端测试（采集包导入：整包原子、包级幂等、合并序列校验、并发一致性）
 tests/test_restore.py  # 端到端测试（按已发布版本恢复未封存周期：原子恢复、空周期/占用拒绝、旧版 default）
+tests/test_withdraw.py # 端到端测试（采集包撤回：只删新增、复用保护、整包拒绝、旧库补列、并发一致性）
 examples/demo.sh       # curl 调用示例（含周期、封存、批量纠正、覆盖审计、回放裁剪、漂移审计、更正预演与采集包导入）
 examples/client.py     # Python 客户端示例（含更正预演、版本恢复等全部 v1.9 能力）
 examples/clip_example.py # 回放裁剪报告窗口最小复现示例
@@ -1030,5 +1111,6 @@ examples/drift_example.py # 现场时钟漂移审计最小复现示例
 examples/rehearsal_example.py # 锚点更正覆盖预演最小复现示例
 examples/bundle_example.py # 采集包导入最小复现示例（整包上传 + 断网重试）
 examples/restore_example.py # 按已发布版本恢复未封存周期最小复现示例（恢复 + 各类拒绝）
+examples/withdraw_example.py # 采集包撤回最小复现示例（撤回 + 幂等重放 + 各类整包拒绝）
 Dockerfile / docker-compose.yml
 ```

@@ -60,6 +60,7 @@ def h_root(ctx, body, query):
             "POST   /segments                                      # body 可带 cycle_id，省略=default",
             "POST   /segments/reassign-cycle           # 批量纠正声段周期归属（整批原子）",
             "POST   /bundles                           # 采集包导入：断网汇聚的设备/周期/锚点/声段整包入库（原子、幂等）",
+            "POST   /bundles/{bundle_id}/withdraw       # 采集包撤回：按包编号撤回首次导入新增的记录（原子、幂等）",
             "POST   /segments/clip                     # 回放裁剪：按 UTC 半开窗口裁出可回放片段",
             "POST   /devices/{device_id}/cycles/{cycle_id}/drift-audit "
             "# 现场时钟漂移审计：相邻锚点配对算速率/漂移 ppm，标出超阈值区间",
@@ -143,6 +144,10 @@ def h_import_bundle(ctx, body, query):
     return service.import_bundle(ctx.db_path, body)
 
 
+def h_withdraw_bundle(ctx, body, query, bundle_id):
+    return service.withdraw_bundle(ctx.db_path, validate_id(bundle_id, "bundle_id"))
+
+
 def h_list_segments(ctx, body, query):
     device_id = query.get("device_id", [None])[0]
     cycle_id = _cycle_query(query)
@@ -222,6 +227,7 @@ ROUTES = [
     ("POST", r"^/segments$", h_submit_segment),
     ("POST", r"^/segments/reassign-cycle$", h_reassign_segment_cycles),
     ("POST", r"^/bundles$", h_import_bundle),
+    ("POST", r"^/bundles/(?P<bundle_id>[^/]+)/withdraw$", h_withdraw_bundle),
     ("POST", r"^/segments/clip$", h_clip_segments),
     ("GET", r"^/segments$", h_list_segments),
     ("GET", r"^/segments/(?P<capture_id>[^/]+)$", h_get_segment),

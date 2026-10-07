@@ -22,6 +22,14 @@
 - bundles 表记录导入成功的包（内容指纹 + 首次结果 JSON），
   同编号同内容重传返回首次结果、不重复写入；同编号异内容拒绝；
 - CREATE TABLE IF NOT EXISTS 随启动执行，旧库自动补表，无数据迁移。
+
+采集包撤回（withdraw，v1.10）：
+- bundles 表增加 added_details（首次导入新增明细 JSON，含新设备隐式
+  default 周期）与 record_keys（包引用记录键集 JSON，用于反查"被其他包
+  复用"），导入成功时一并落盘；withdrawn_at / withdrawal_result 记录
+  撤回时间与首次撤回结果，重复撤回原样返回；
+- 旧库的 bundles 行四列均为 NULL：added_details 为空即"旧包缺少新增
+  明细"，撤回明确拒绝；_ensure_bundle_columns 随启动自动补列。
 """
 from __future__ import annotations
 
@@ -105,10 +113,21 @@ CREATE TABLE IF NOT EXISTS version_segments (
 -- 采集包（bundle，v1.8）：断网汇聚的多设备记录整包导入。
 -- 仅记录导入成功的包：内容指纹用于"同编号同内容重传返回首次结果"，
 -- result 为首次导入结果（JSON），重传时原样返回，不重复写入。
+-- v1.10 起追加四列（撤回能力）：
+--   added_details     首次导入新增明细 JSON（设备/周期/锚点/声段全内容，
+--                     含新设备隐式 default 周期）；NULL = 旧包无明细，不可撤回
+--   record_keys       包引用记录键集 JSON（新增+复用），撤回时反查"被其他包复用"
+--   withdrawn_at      撤回时间（NULL = 未撤回）；撤回后包行保留，
+--                     同编号重传仍返回首次导入回执且不重新写入
+--   withdrawal_result 首次撤回结果 JSON，重复撤回原样返回（幂等）
 CREATE TABLE IF NOT EXISTS bundles (
     bundle_id    TEXT PRIMARY KEY,
     content_hash TEXT NOT NULL,
     result       TEXT NOT NULL,
+    added_details TEXT,
+    record_keys  TEXT,
+    withdrawn_at TEXT,
+    withdrawal_result TEXT,
     created_at   TEXT NOT NULL
 );
 """
@@ -234,6 +253,22 @@ def _ensure_seal_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE cycles ADD COLUMN seal_fingerprint TEXT")
 
 
+def _ensure_bundle_columns(conn: sqlite3.Connection) -> None:
+    """采集包撤回列（v1.10）：为旧库的 bundles 表补齐 added_details /
+    record_keys / withdrawn_at / withdrawal_result。
+
+    旧行 added_details 为 NULL，即"旧包缺少首次导入新增明细"，
+    撤回时明确拒绝；withdrawn_at 为 NULL 即"未撤回"，原有重传幂等行为不变。
+    """
+    cols = _columns(conn, "bundles")
+    if not cols:
+        return
+    for name in ("added_details", "record_keys", "withdrawn_at",
+                 "withdrawal_result"):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE bundles ADD COLUMN {name} TEXT")
+
+
 def init_db(db_path: str) -> None:
     """初始化数据库（建表 + 旧库迁移）。服务启动时调用，幂等。"""
     parent = os.path.dirname(os.path.abspath(db_path))
@@ -252,6 +287,8 @@ def init_db(db_path: str) -> None:
         conn.executescript(SCHEMA)
         # 列级迁移：旧库的 cycles 表（含 v1 迁移而来的）补齐封存列
         _ensure_seal_columns(conn)
+        # 列级迁移：旧库的 bundles 表补齐撤回列（v1.10）
+        _ensure_bundle_columns(conn)
     finally:
         conn.close()
 
